@@ -45,7 +45,7 @@ EPOCHS = 100
 LEARNING_RATE = 1e-4
 
 # Quantized model training hyperparameters
-BIT_WIDTH = 8
+BIT_WIDTH = 4
 QAT_BATCH_SIZE = 32 # Batch size menor ou igual ao original para o treinamento do modelo quantizado, para evitar problemas de memoria. Ajuste conforme a capacidade da sua GPU.
 QAT_EPOCHS = 50 # Treinar por menos epocas do que o modelo original, pois o modelo quantizado tem menos capacidade e pode convergir mais rapido
 QAT_LEARNING_RATE = 1e-4
