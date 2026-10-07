@@ -1,19 +1,20 @@
 import numpy as np
 import qonnx.core.data_layout as DataLayout
 import warnings
+
 from onnx import TensorProto
 from onnx import helper as oh
 from onnx import helper
+
 from qonnx.core.datatype import DataType
-from qonnx.core.onnx_exec import execute_node
 from qonnx.custom_op.registry import getCustomOp
 from qonnx.transformation.base import Transformation
-from qonnx.transformation.general import SortGraph
-from qonnx.transformation.infer_data_layouts import InferDataLayouts
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.util.basic import get_by_name
 from qonnx.core.modelwrapper import ModelWrapper
+
+from finn.transformation.fpgadataflow.specialize_layers import _determine_impl_style
 
 class MoveMulPastAvgPool(Transformation):
     """
@@ -295,7 +296,9 @@ class RemoveUselessMultiThresholds(Transformation):
 
 
 class StrictRoundAndClipThresholds(Transformation):
-    """For MultiThreshold, Thresholding, MVAU, and VVAU nodes operating on integer inp/accumulators,
+    """
+    THIS IS A COPY OF THE FINN MOST RECENT RoundAndClipThresholds FUNCTION ON GITHUB. THE ONE STORES IN MY CONTAINER IS OUTDATED AND DOES NOT WORK PROPERLY.
+    For MultiThreshold, Thresholding, MVAU, and VVAU nodes operating on integer inp/accumulators,
     round up (ceil) threshold values to the nearest integer and clip to valid range.
     Type-casts thresholds (back) to the float32 container type (this is separate from the
     quantization annotation). Runs InferDataTypes() afterward to propagate any changes to the
@@ -322,7 +325,7 @@ class StrictRoundAndClipThresholds(Transformation):
                     #   introduce extra inaccuracies due to large integers not being
                     #   exactly representable in floating-point representation.
                     #   See for example: np.ceil(np.float32(16777217)) == 16777216
-                    new_thresholds = np.clip(np.ceil(thresholds), dtype.min(), dtype.max()) # CHANGING MAX CLIP FROM dtype.max() + 1 TO dtype.max() BECAUSE IT WAS CAUSING AN ERROR IN THE MODEL.
+                    new_thresholds = np.clip(np.ceil(thresholds), dtype.min(), dtype.max() + 1)
                     # Convert back to the preferred float32 container type
                     new_thresholds = new_thresholds.astype(np.float32)
                     # Insert the rounded and clipped thresholds back into the model
@@ -330,7 +333,7 @@ class StrictRoundAndClipThresholds(Transformation):
                     # The rounded and clipped thresholds now fit into a data type
                     # that is one bit bigger than the input datatype
                     # Determine new max_value
-                    max_val = dtype.max()  # CHANGING MAX CLIP FROM dtype.max() + 1 TO dtype.max() BECAUSE IT WAS CAUSING AN ERROR IN THE MODEL.
+                    max_val = dtype.max() + 1
                     if not dtype.signed():
                         tdt = DataType.get_smallest_possible(max_val)
                     else:
@@ -412,3 +415,83 @@ class StrictRoundAndClipThresholds(Transformation):
 
         model = model.transform(InferDataTypes())
         return model, graph_modified
+
+
+class RedefineImplStyle(Transformation):
+    """Convert hls to rlt or vice versa based on the init parameters. Based on the FINN SpecializeLayers transformation."""
+
+    def __init__(self, impl_style, fpgapart):
+        super().__init__()
+
+        if impl_style not in ["hls", "rtl"]:
+            raise ValueError("impl_style must be either 'hls' or 'rtl'")
+
+        self.new_impl_style = impl_style
+        self.old_impl_style = 'hls' if impl_style == 'rtl' else 'rtl'
+        self.fpgapart = fpgapart
+
+    def apply(self, model):
+        graph = model.graph
+        node_ind = 0
+        for node in graph.node:
+
+            # Skip nodes that are not the old implementation style layers
+            if not node.domain == f"finn.custom_op.fpgadataflow.{self.old_impl_style}":
+                node_ind += 1
+                continue
+            node_inst = getCustomOp(node)
+            # If the node already has the new preferred impl style, but is still in the old impl style, we skip it.
+            if node_inst.get_nodeattr("preferred_impl_style") == self.new_impl_style:
+                node_ind += 1
+                continue
+
+            # First we set the preferred_impl_style attribute to the new implementation style, so that the node can be re-specialized to the new implementation style
+            node_inst.set_nodeattr("preferred_impl_style", self.new_impl_style)
+
+            # The name, op_type and domain are set to hls or rtl, so we replace it with base_op_type, so that the node can be re-specialized to the new implementation style
+            base_name = node.name.replace(f"_{self.old_impl_style}", "")
+            node.name = base_name
+            base_op_type = node.op_type.replace(f"_{self.old_impl_style}", "")
+            node.op_type = base_op_type
+            node.domain = "finn.custom_op.fpgadataflow"
+
+            # For shuffle nodes the specialisation happens after
+            # the ShuffleDecomposition transformation with a
+            # dedicated InferInnerOuterShuffle transformation
+            if node.op_type == "Shuffle":
+                node_ind += 1
+                continue
+            impl_style = _determine_impl_style(node, self.fpgapart, model)
+            optype = node.op_type + "_" + impl_style
+
+            new_node = helper.make_node(
+                optype,
+                node.input,
+                node.output,
+                name=node.name,
+                domain="finn.custom_op.fpgadataflow." + impl_style,
+            )
+
+            # List of old attributes that must be removed from the new node, since they are not used anymore in the new implementation style
+            stale_attrs = [
+                "code_gen_dir_ipgen", 
+                "ip_path", 
+                "ip_vlnv", 
+                "ipgen_path"
+            ]
+
+            # add all attributes
+            for attribute in node.attribute:
+                if attribute.name in stale_attrs:
+                    # Create a new attribute with an empty string as its value
+                    clean_attr = helper.make_attribute(attribute.name, "")
+                    new_node.attribute.append(clean_attr)
+                else:
+                    new_node.attribute.append(attribute)
+            graph.node.insert(node_ind, new_node)
+            # remove old nodes
+            graph.node.remove(node)
+            # Stop the loop since we changed the ONNX graph size.
+            # This is necessary to avoid issues with the iteration over the graph nodes.
+            return (model, True)
+        return (model, False)
