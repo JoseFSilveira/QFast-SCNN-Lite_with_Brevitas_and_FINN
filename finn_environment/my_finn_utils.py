@@ -7,6 +7,19 @@ import json
 from config import IGNORE_INDEX, NUM_CLASSES
 
 
+def calculate_total_resource_usage(resource_dict: dict) -> dict:
+    '''
+    Calculates the total resource usage from the resource dict.
+    '''
+    totals = {'BRAM_18K': 0.0, 'DSP': 0.0, 'LUT': 0.0, 'URAM': 0.0}
+    for layer, resources in resource_dict.items():
+        for resource, usage in resources.items():
+            if resource in totals:
+                totals[resource] += usage
+    totals['total'] = totals.copy()  # Add a 'total' key with the same values as the top-level totals
+    return totals
+
+
 def read_json_dict(filename):
     with open(filename, "r") as f:
         ret = json.load(f)

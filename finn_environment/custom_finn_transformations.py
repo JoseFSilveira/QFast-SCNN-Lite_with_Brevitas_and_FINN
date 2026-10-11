@@ -13,8 +13,28 @@ from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.util.basic import get_by_name
 from qonnx.core.modelwrapper import ModelWrapper
+import qonnx.core.data_layout as DataLayout
 
 from finn.transformation.fpgadataflow.specialize_layers import _determine_impl_style
+from qonnx.transformation.general import GiveReadableTensorNames, GiveUniqueNodeNames
+from qonnx.transformation.infer_data_layouts import InferDataLayouts
+from shutil import copy
+
+from finn.transformation.fpgadataflow.create_dataflow_partition import (
+    CreateDataflowPartition,
+)
+from finn.transformation.fpgadataflow.floorplan import Floorplan
+from finn.transformation.fpgadataflow.insert_dwc import InsertDWC
+from finn.transformation.fpgadataflow.insert_fifo import InsertFIFO
+from finn.transformation.fpgadataflow.insert_iodma import InsertIODMA
+from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
+from finn.util.basic import (
+    make_build_dir,
+    pynq_native_port_width,
+    pynq_part_map,
+    resolve_xilinx_tool,
+)
+
 
 class MoveMulPastAvgPool(Transformation):
     """
@@ -179,6 +199,114 @@ class MoveScalarLinearPastConcat(Transformation):
         model = model.transform(InferShapes())
         return (model, graph_modified)
 
+
+class RevertNCHWElementwiseToONNX(Transformation):
+    """
+    Search for ElementwiseAdd and ElementwiseMul nodes with NCHW format on inputs and outputs to corresponding ONNX Add and Mul nodes.
+    """
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+        for idx, n in enumerate(graph.node):
+            if n.op_type in ["ElementwiseMul", "ElementwiseAdd"]:
+                # Find the input and output tensor layouts for the ElementwiseAdd or ElementwiseMul node
+                inp_layouts = [model.get_tensor_layout(inp) for inp in n.input]
+                inp_layouts = [layout for layout in inp_layouts if layout is not None]  # Remove None values from the list of input layouts
+                out_layout = model.get_tensor_layout(n.output[0])
+
+                # Check if the input and output tensor layouts are all NCHW
+                is_nchw = all(in_layout == DataLayout.NCHW for in_layout in inp_layouts) and (out_layout == DataLayout.NCHW)
+                if not is_nchw:
+                    warnings.warn(
+                        "%s: Not all input and output tensor layouts are NCHW. Can't operate transformation on node." % n.name
+                    )
+                    continue
+
+                # If all checks passed, we can proceed to convert the ElementwiseAdd or ElementwiseMul node to the corresponding ONNX Add or Mul node
+                base_op = n.op_type.replace("Elementwise", "")
+                
+                new_node = helper.make_node(
+                    base_op,
+                    n.input,
+                    n.output,
+                    name=n.name
+                )
+                # Substitui no mesmo índice para manter a topologia
+                graph.node.remove(n)
+                graph.node.insert(idx, new_node)
+                graph_modified = True
+                break
+
+        return (model, graph_modified)
+
+
+class MakeElementwiseAddNHWC(Transformation):
+    """
+    Converts the inputs and outputs for all ElementwiseAdd Layers from NCHW to NHWC.
+    Only proceeds if the Concat all producers and consumers have op_type "Transpose".
+    """
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+        node_ind = 0
+        for n in graph.node:
+            node_ind += 1
+            if n.op_type == "ElementwiseAdd":
+                consumer = model.find_consumer(n.output[0])
+                producers = [model.find_producer(inp) for inp in n.input]
+
+                # Verify if all producers and the consumer are not None and have op_type "Transpose"
+                if not all(producer is not None and producer.op_type == "Transpose" for producer in producers):
+                    warnings.warn(
+                        "%s: Not all producers are Transpose. Can't operate transformation on node." % n.name
+                    )
+                    continue
+                if consumer is None or consumer.op_type != "Transpose":
+                    warnings.warn(
+                        "%s: Consumer is not Transpose. Can't operate transformation on node." % n.name
+                    )
+                    continue
+
+                # Verify if all producers have (N, H, W, C) -> (N, C, H, W) transpose pattern
+                if not all(list(get_by_name(producer.attribute, "perm").ints) == [0, 3, 1, 2] for producer in producers):
+                    warnings.warn(
+                        "%s: Not all producers have (N, H, W, C) -> (N, C, H, W) transpose pattern. Can't operate transformation on node." % n.name
+                    )
+                    continue
+                # Verify if the consumer have (N, C, H, W) -> (N, H, W, C) transpose pattern
+                if not list(get_by_name(consumer.attribute, "perm").ints) == [0, 2, 3, 1]:
+                    warnings.warn(
+                        "%s: Consumer does not have (N, C, H, W) -> (N, H, W, C) transpose pattern. Can't operate transformation on node." % n.name
+                    )
+                    continue
+
+                # If all checks passed, we can proceed to convert the ElementwiseAdd node from NCHW to NHWC
+                new_nhwc_shape = model.get_tensor_shape(consumer.output[0])
+                for attr in n.attribute:
+                    # Set the inputs and outputs to the NHWC layout
+                    if attr.name in ["lhs_shape", "rhs_shape", "out_shape"]:
+                        inst = getCustomOp(n)
+                        inst.set_nodeattr(attr.name, new_nhwc_shape)
+
+                # And then proceed to erase the Transpose nodes and rewire the graph accordingly
+                start_names = [producer.input[0] for producer in producers]
+                end_name = consumer.output[0]
+                n.output[0] = end_name
+                for i in range(len(producers)):
+                    n.input[i] = start_names[i]
+
+                graph.node.remove(consumer)
+                for producer in producers:
+                    graph.node.remove(producer)
+
+                # Break the loop after modifying the graph to avoid issues with iterating over a modified list of nodes
+                graph_modified = True
+                break
+
+        return (model, graph_modified)
+    
 
 class MakeConcatNHWC(Transformation):
     """
@@ -494,4 +622,63 @@ class RedefineImplStyle(Transformation):
             # Stop the loop since we changed the ONNX graph size.
             # This is necessary to avoid issues with the iteration over the graph nodes.
             return (model, True)
+        return (model, False)
+
+
+class SetGlobalFIFODepths(Transformation):
+    def __init__(self, depth=64):
+        super().__init__()
+        self.depth = depth
+
+    def apply(self, model):
+        for node in model.graph.node:
+            prefix = node.name + "_"
+            if "fpgadataflow" in node.domain:
+                inst = getCustomOp(node)
+                try:
+                    num_in = len(inst.get_nodeattr("inFIFODepths"))
+                    inst.set_nodeattr("inFIFODepths", [self.depth] * num_in)
+                except KeyError:
+                    pass
+                try:
+                    num_out = len(inst.get_nodeattr("outFIFODepths"))
+                    inst.set_nodeattr("outFIFODepths", [self.depth] * num_out)
+                except KeyError:
+                    pass
+        return (model, False)
+
+
+class PrepareModelForFPGADesign(Transformation):
+    '''
+    Partially runs the ZynqBuild Transform to make it possible tu run estimates before actual build.
+    '''
+    def __init__(self, platform="Pynq-Z2"):
+        super().__init__()
+        self.fpga_part = pynq_part_map[platform]
+        self.axi_port_width = pynq_native_port_width[platform]
+        
+    def apply(self, model):
+        # first infer layouts
+        model = model.transform(InferDataLayouts())
+        # prepare at global level, then break up into kernels
+        prep_transforms = [
+            InsertIODMA(self.axi_port_width),
+            InsertDWC(),
+            SpecializeLayers(self.fpga_part),
+            Floorplan(),
+        ]
+        for trn in prep_transforms:
+            model = model.transform(trn)
+            model = model.transform(GiveUniqueNodeNames())
+            model = model.transform(GiveReadableTensorNames())
+        # Build each kernel individually
+        sdp_nodes = model.get_nodes_by_op_type("StreamingDataflowPartition")
+        for sdp_node in sdp_nodes:
+            prefix = sdp_node.name + "_"
+            sdp_node = getCustomOp(sdp_node)
+            dataflow_model_filename = sdp_node.get_nodeattr("model")
+            kernel_model = ModelWrapper(dataflow_model_filename)
+            kernel_model = kernel_model.transform(InsertFIFO())
+            kernel_model = kernel_model.transform(SpecializeLayers(self.fpga_part))
+            kernel_model = kernel_model.transform(GiveUniqueNodeNames(prefix))
         return (model, False)
