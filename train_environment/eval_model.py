@@ -77,6 +77,7 @@ class EvalModel():
     def eval(self, dataloader: torch.utils.data.DataLoader, metrics: dict, loss_fn: callable=None):
 
         self.model.eval()
+        ev_model = torch.compile(self.model) # Compila o modelo para melhorar a performance.
 
         metric_names = list(metrics.keys())
         metric_fns = list(metrics.values()) 
@@ -90,7 +91,7 @@ class EvalModel():
         with torch.inference_mode():
             for (X, y) in tqdm(dataloader):
                 X, y = X.to(self.device), y.to(self.device)
-                y_pred = self.model(X)
+                y_pred = ev_model(X)
 
                 if loss_fn is not None:
                     val_loss += loss_fn(y_pred, y.long()).item() # Accumulate the scalar value

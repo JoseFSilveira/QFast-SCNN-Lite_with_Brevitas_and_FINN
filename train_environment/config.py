@@ -41,7 +41,7 @@ IGNORE_INDEX = 255 # Valor do pixel para a classe de ignorar (void)
 
 # Original model Training Hyperparameters
 BATCH_SIZE = 32
-EPOCHS = 300
+EPOCHS = 100
 LEARNING_RATE = 1e-4
 
 # Quantized model training hyperparameters
