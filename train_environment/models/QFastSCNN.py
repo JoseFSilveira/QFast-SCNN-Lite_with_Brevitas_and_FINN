@@ -25,32 +25,50 @@ from brevitas.quant.scaled_int import Int8WeightPerTensorFloat, Uint8ActPerTenso
 from brevitas.quant_tensor import QuantTensor
 from brevitas.inject.enum import *
 
-from config import BIT_WIDTH, IM_SIZE
+from config import ACT_BIT_WIDTH, OUT_BIT_WIDTH, WEIGHT_BIT_WIDTH, IM_SIZE
 
 
 class IntActPerTensorFloat(Int8ActPerTensorFloat):
     """
     Custom subclass of Int8ActPerTensorFloat to allow for a different bit width to be set at runtime.
     This is necessary since the original Int8ActPerTensorFloat class has a fixed bit width of 8 bits.
-    QuantEltwiseAdd and QuantCat layers ignores the bit_width parameter, so we need to ensure that all inputs and outputs have the same bit width.
     """
-    bit_width = BIT_WIDTH
+    bit_width = ACT_BIT_WIDTH
 
 class UintActPerTensorFloat(Uint8ActPerTensorFloat):
     """
     Custom subclass of Uint8ActPerTensorFloat to allow for a different bit width to be set at runtime.
     This is necessary since the original Uint8ActPerTensorFloat class has a fixed bit width of 8 bits.
-    QuantEltwiseAdd and QuantCat layers ignores the bit_width parameter, so we need to ensure that all inputs and outputs have the same bit width.
     """
-    bit_width = BIT_WIDTH
+    bit_width = ACT_BIT_WIDTH
+
+class IntOutActPerTensorFloat(Int8ActPerTensorFloat):
+    """
+    Custom subclass of Int8ActPerTensorFloat to allow for a different bit width to be set at runtime.
+    This is necessary since the original Int8ActPerTensorFloat class has a fixed bit width of 8 bits.
+    """
+    bit_width = OUT_BIT_WIDTH
+
+class UintOutActPerTensorFloat(Uint8ActPerTensorFloat):
+    """
+    Custom subclass of Uint8ActPerTensorFloat to allow for a different bit width to be set at runtime.
+    This is necessary since the original Uint8ActPerTensorFloat class has a fixed bit width of 8 bits.
+    """
+    bit_width = OUT_BIT_WIDTH
 
 class IntWeightPerTensorFloat(Int8WeightPerTensorFloat):
     """
     Custom subclass of Int8WeightPerTensorFloat to allow for a different bit width to be set at runtime.
     This is necessary since the original Int8WeightPerTensorFloat class has a fixed bit width of 8 bits.
-    Conv layers with return_quant_tensor=False ignores the bit_width parameter, so we need to ensure that all inputs and outputs have the same bit width.
     """
-    bit_width = BIT_WIDTH
+    bit_width = WEIGHT_BIT_WIDTH
+
+class IntWeightAvgPool(Int8WeightPerTensorFloat):
+    """
+    Custom subclass of Int8WeightPerTensorFloat to allow for a different bit width to be set at runtime.
+    This is necessary since the original Int8WeightPerTensorFloat class has a fixed bit width of 8 bits.
+    """
+    bit_width = 2
 
 
 class AvgPoolFINNFriendly(nn.Module):
@@ -69,8 +87,7 @@ class AvgPoolFINNFriendly(nn.Module):
                                 stride=kernel_size,
                                 groups=channels,
                                 bias=False,
-                                bit_width=BIT_WIDTH,
-                                weight_quant=IntWeightPerTensorFloat,
+                                weight_quant=IntWeightAvgPool,
                                 return_quant_tensor=False)
         # Freeze the weights of the depthwise convolution layer to 1
         for param in self.pool.parameters():
@@ -89,7 +106,7 @@ class AvgPoolFINNFriendly(nn.Module):
         self.div = lambda x: x * avgpool_scale_factor
 
         # Quantize the output of the average pooling operation using per-tensor quantization with a floating-point scale.
-        self.act_quant = qnn.QuantIdentity(act_quant=Int8ActPerTensorFloat, bit_width=BIT_WIDTH, return_quant_tensor=True)
+        self.act_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
 
     def forward(self, x):
         x = self.pool(x)
@@ -129,7 +146,7 @@ class QFastSCNN(nn.Module):
         assert mode in possible_modes, f"Mode {mode} not supported. Choose one of {possible_modes}."
         self.mode = mode
 
-        self.inp_quant = qnn.QuantIdentity(act_quant=Int8ActPerTensorFloat, bit_width=BIT_WIDTH, return_quant_tensor=True)
+        self.inp_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
         self.learning_to_downsample = LearningToDownsample(32, 48, 64)
         self.global_feature_extractor = GlobalFeatureExtractor(in_channels=64, block_channels=[64, 96, 128], out_channels=128, t=2, num_blocks=[2, 2, 2])
         self.feature_fusion = FeatureFusionModule(64, 128, 128)
@@ -169,9 +186,11 @@ class _ConvBNReLU(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, **kwargs):
         super(_ConvBNReLU, self).__init__()
         self.conv = nn.Sequential(
-            qnn.QuantConv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False, weight_bit_width=BIT_WIDTH, weight_quant=Int8WeightPerTensorFloat, return_quant_tensor=True),
+            qnn.QuantConv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False,
+                            weight_quant=IntWeightPerTensorFloat,
+                            return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
-            qnn.QuantReLU(inplace=True, bit_width=BIT_WIDTH, act_quant=Uint8ActPerTensorFloat, return_quant_tensor=True)
+            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
         )
 
     def forward(self, x):
@@ -184,12 +203,16 @@ class _DSConv(nn.Module):
     def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
         super(_DSConv, self).__init__()
         self.conv = nn.Sequential(
-            qnn.QuantConv2d(dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False, weight_bit_width=BIT_WIDTH, weight_quant=Int8WeightPerTensorFloat, return_quant_tensor=True),
+            qnn.QuantConv2d(dw_channels, dw_channels, 3, stride, 1, groups=dw_channels, bias=False,
+                            weight_quant=IntWeightPerTensorFloat,                            
+                            return_quant_tensor=True),
             nn.BatchNorm2d(dw_channels),
-            qnn.QuantReLU(inplace=True, bit_width=BIT_WIDTH, act_quant=Uint8ActPerTensorFloat, return_quant_tensor=True),
-            qnn.QuantConv2d(dw_channels, out_channels, 1, bias=False, weight_bit_width=BIT_WIDTH, weight_quant=Int8WeightPerTensorFloat, return_quant_tensor=True),
+            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True),
+            qnn.QuantConv2d(dw_channels, out_channels, 1, bias=False,
+                            weight_quant=IntWeightPerTensorFloat,
+                            return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
-            qnn.QuantReLU(inplace=True, bit_width=BIT_WIDTH, act_quant=Uint8ActPerTensorFloat, return_quant_tensor=True)
+            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
         )
 
     def forward(self, x):
@@ -200,9 +223,11 @@ class _DWConv(nn.Module):
     def __init__(self, dw_channels, out_channels, stride=1, **kwargs):
         super(_DWConv, self).__init__()
         self.conv = nn.Sequential(
-            qnn.QuantConv2d(dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False, weight_bit_width=BIT_WIDTH, weight_quant=Int8WeightPerTensorFloat, return_quant_tensor=True),
+            qnn.QuantConv2d(dw_channels, out_channels, 3, stride, 1, groups=dw_channels, bias=False,
+                            weight_quant=IntWeightPerTensorFloat,                            
+                            return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
-            qnn.QuantReLU(inplace=True, bit_width=BIT_WIDTH, act_quant=Uint8ActPerTensorFloat, return_quant_tensor=True)
+            qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
         )
 
     def forward(self, x):
@@ -221,16 +246,18 @@ class LinearBottleneck(nn.Module):
             # dw
             _DWConv(in_channels * t, in_channels * t, stride),
             # pw-linear
-            qnn.QuantConv2d(in_channels * t, out_channels, 1, bias=False, weight_bit_width=BIT_WIDTH, weight_quant=Int8WeightPerTensorFloat, return_quant_tensor=True),
+            qnn.QuantConv2d(in_channels * t, out_channels, 1, bias=False,
+                            weight_quant=IntWeightPerTensorFloat,
+                            return_quant_tensor=True),
             nn.BatchNorm2d(out_channels),
         )
 
         # quantize the output so it can be used in the skip connection addition
-        self.act_quant = qnn.QuantIdentity(act_quant=Int8ActPerTensorFloat, bit_width=BIT_WIDTH, return_quant_tensor=True)
+        self.act_quant = qnn.QuantIdentity(act_quant=IntActPerTensorFloat, return_quant_tensor=True)
         
         # Added quantization for the skip connection
         if self.use_shortcut:
-            self.add = qnn.QuantEltwiseAdd(bit_width=BIT_WIDTH, return_quant_tensor=True,
+            self.add = qnn.QuantEltwiseAdd(return_quant_tensor=True,
                                            input_quant=IntActPerTensorFloat, output_quant=IntActPerTensorFloat)
         
     def forward(self, x):
@@ -274,10 +301,10 @@ class PyramidPooling(nn.Module):
         self.pool4 = AvgPoolFINNFriendly(in_channels, self.kernel_size[3], return_quant_tensor=True)
 
         # First Concat operation to concatenate the features with depth=32, resulting in a new tensor with depth=128; return_quant_tensor=False and output_quant=None since the next concat operation will quantize the output again.
-        self.concat1 = CustomQuantCat(bit_width=BIT_WIDTH, return_quant_tensor=False,
+        self.concat1 = CustomQuantCat(return_quant_tensor=False,
                                       input_quant=IntActPerTensorFloat, output_quant=None)
         # Second Concat operation to concatenate the original tensor with depth=128 with the previously generated tensor with depth=128, resulting in the final tensor with depth=256.
-        self.concat2 = CustomQuantCat(bit_width=BIT_WIDTH, return_quant_tensor=True,
+        self.concat2 = CustomQuantCat(return_quant_tensor=True,
                                       input_quant=IntActPerTensorFloat, output_quant=IntActPerTensorFloat)
 
     def upsample(self, x, scale_factor):
@@ -346,22 +373,20 @@ class FeatureFusionModule(nn.Module):
         self.dwconv = _DWConv(lower_in_channels, out_channels, 1)
         self.conv_lower_res = nn.Sequential(
             qnn.QuantConv2d(out_channels, out_channels, 1,
-                            weight_bit_width=BIT_WIDTH,
-                            weight_quant=Int8WeightPerTensorFloat,
+                            weight_quant=IntWeightPerTensorFloat,
                             return_quant_tensor=True),
             nn.BatchNorm2d(out_channels)
         )
         self.conv_higher_res = nn.Sequential(
             qnn.QuantConv2d(highter_in_channels, out_channels, 1,
-                            weight_bit_width=BIT_WIDTH,
-                            weight_quant=Int8WeightPerTensorFloat,
+                            weight_quant=IntWeightPerTensorFloat,
                             return_quant_tensor=True),
             nn.BatchNorm2d(out_channels)
         )
-        self.relu = qnn.QuantReLU(inplace=True, bit_width=BIT_WIDTH, act_quant=Uint8ActPerTensorFloat, return_quant_tensor=True)
+        self.relu = qnn.QuantReLU(inplace=True, act_quant=UintActPerTensorFloat, return_quant_tensor=True)
 
         # Added quantization for the skip connection; return_quant_tensor=False and output_quant=None since QuantEltwiseAdd will quantize the output again.
-        self.add = qnn.QuantEltwiseAdd(bit_width=BIT_WIDTH, return_quant_tensor=False,
+        self.add = qnn.QuantEltwiseAdd(return_quant_tensor=False,
                                        input_quant=IntActPerTensorFloat, output_quant=None)
 
     def upsample(self, x, scale_factor):
@@ -387,10 +412,10 @@ class Classifer(nn.Module):
         self.dsconv1 = _DSConv(dw_channels, dw_channels, stride)
         self.dsconv2 = _DSConv(dw_channels, dw_channels, stride)
         self.conv = nn.Sequential(
-            nn.Dropout(0.1),
+            nn.Identity(), # in place of dropout to not alter layer indexes.
             qnn.QuantConv2d(dw_channels, num_classes, 1,
-                            weight_bit_width=BIT_WIDTH,
-                            weight_quant=Int8WeightPerTensorFloat,
+                            weight_quant=IntWeightPerTensorFloat,
+                            act_quant=IntOutActPerTensorFloat,
                             return_quant_tensor=False)
         )
 
